@@ -7,6 +7,11 @@ __pycache__/
 .Python
 env/
 virtualenv/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.h5
 
 # Environment variables
 .env
