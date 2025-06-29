@@ -26,7 +26,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     EarlyStoppingCallback
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft import LoraConfig, get_peft_model, TaskType
 from datasets import Dataset, DatasetDict
 from sklearn.model_selection import train_test_split
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 class ModelConfig:
     """Configuration for model and training parameters"""
     model_name: str = "microsoft/Phi-3-mini-4k-instruct"
-    max_length: int = 2048
+    max_length: int = 1024  # Reduced from 2048 to save memory
     output_dir: str = "phi3-wealth-lora"
     
     # LoRA Configuration
@@ -49,8 +49,8 @@ class ModelConfig:
     
     # Training Configuration (will be adjusted based on GPU count)
     num_epochs: int = 3
-    base_batch_size: int = 2  # Base batch size per GPU
-    gradient_accumulation_steps: int = 4  # Will be adjusted
+    base_batch_size: int = 1  # Reduced from 2 to save memory
+    gradient_accumulation_steps: int = 8  # Increased to maintain effective batch size
     learning_rate: float = 2e-4
     warmup_steps: int = 100
     weight_decay: float = 0.01
@@ -69,6 +69,15 @@ class ModelConfig:
 
 class GPUManager:
     """Manages GPU detection and configuration"""
+    
+    @staticmethod
+    def check_flash_attention():
+        """Check if Flash Attention 2 is available"""
+        try:
+            import flash_attn
+            return True
+        except ImportError:
+            return False
     
     @staticmethod
     def get_gpu_info():
@@ -126,20 +135,20 @@ class GPUManager:
     def log_gpu_status(gpu_info):
         """Log current GPU configuration"""
         if not gpu_info['available']:
-            logger.info("🖥️  Training on CPU")
+            logger.info("Training on CPU")
             return
         
         if gpu_info['use_ddp']:
-            logger.info(f"🚀 Distributed training on {gpu_info['world_size']} GPUs")
+            logger.info(f"Distributed training on {gpu_info['world_size']} GPUs")
             if gpu_info['local_rank'] == 0:
                 for i in range(torch.cuda.device_count()):
                     logger.info(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
         elif gpu_info['count'] > 1:
-            logger.info(f"🚀 Multi-GPU training on {gpu_info['count']} GPUs")
+            logger.info(f"Multi-GPU training on {gpu_info['count']} GPUs")
             for i in range(gpu_info['count']):
                 logger.info(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
         else:
-            logger.info(f"🖥️  Single GPU training: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Single GPU training: {torch.cuda.get_device_name(0)}")
 
 class WealthManagementTrainer:
     """Enhanced trainer for Phi-3 wealth management fine-tuning with auto GPU detection"""
@@ -174,7 +183,7 @@ class WealthManagementTrainer:
             self.effective_batch_size = self.config.base_batch_size
             self.config.gradient_accumulation_steps = max(1, 8 // self.effective_batch_size)
         
-        logger.info(f"📊 Training configuration:")
+        logger.info(f"Training configuration:")
         logger.info(f"   Batch size per device: {self.effective_batch_size}")
         logger.info(f"   Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
         logger.info(f"   Effective batch size: {self.effective_batch_size * self.config.gradient_accumulation_steps * max(1, gpu_count)}")
@@ -198,6 +207,7 @@ class WealthManagementTrainer:
         model_kwargs = {
             "trust_remote_code": True,
             "torch_dtype": torch.bfloat16 if self.gpu_info['available'] else torch.float32,
+            "use_cache": False,  # Disable caching to save memory
         }
         
         if self.gpu_info['use_ddp']:
@@ -216,21 +226,35 @@ class WealthManagementTrainer:
         
         # Add attention implementation if GPU available
         if self.gpu_info['available']:
-            try:
+            if GPUManager.check_flash_attention():
                 model_kwargs["attn_implementation"] = "flash_attention_2"
-            except:
-                logger.warning("Flash Attention 2 not available, using eager attention")
+                if not self.gpu_info['use_ddp'] or self.gpu_info['local_rank'] == 0:
+                    logger.info("Using Flash Attention 2 for optimized performance")
+            else:
+                # Fallback to eager attention if Flash Attention not available
                 model_kwargs["attn_implementation"] = "eager"
+                if not self.gpu_info['use_ddp'] or self.gpu_info['local_rank'] == 0:
+                    logger.warning("Flash Attention 2 not available, using eager attention")
+                    logger.info("For better performance, install with: pip install flash-attn --no-build-isolation")
         
         # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name,
-            **model_kwargs
-        )
-        
-        # Prepare for LoRA training
-        if self.gpu_info['available']:
-            self.model = prepare_model_for_kbit_training(self.model)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name,
+                **model_kwargs
+            )
+        except RuntimeError as e:
+            logger.error(f"Error loading model: {str(e)}")
+            # If Flash Attention caused issues, retry without it
+            if "flash_attention_2" in str(e):
+                logger.warning("Retrying without Flash Attention due to compatibility issues")
+                model_kwargs["attn_implementation"] = "eager"
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model_name,
+                    **model_kwargs
+                )
+            else:
+                raise
         
         # Setup LoRA configuration
         lora_config = LoraConfig(
@@ -244,6 +268,15 @@ class WealthManagementTrainer:
         )
         
         self.model = get_peft_model(self.model, lora_config)
+        
+        # # Enable gradient checkpointing to save memory
+        # self.model.gradient_checkpointing_enable()
+        # self.model.config.use_cache = False  # Disable cache for gradient checkpointing
+        
+        # Verify parameters are trainable
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"Trainable params: {trainable_params} || All params: {total_params} || Trainable: {100 * trainable_params / total_params:.2f}%")
         
         # Only print on main process for DDP
         if not self.gpu_info['use_ddp'] or self.gpu_info['local_rank'] == 0:
@@ -289,16 +322,17 @@ class WealthManagementTrainer:
             'test': Dataset.from_list(test_data)
         })
         
-        # Tokenize datasets
+        # Tokenize datasets in batches to reduce memory usage
         self.datasets = self.datasets.map(
             self.tokenize_function,
+            batched=True,
+            batch_size=100,  # Process 100 examples at a time
             remove_columns=self.datasets['train'].column_names,
             desc="Tokenizing datasets" if not self.gpu_info['use_ddp'] or self.gpu_info['local_rank'] == 0 else None
         )
         
     def tokenize_function(self, examples):
         """Enhanced tokenization with proper chat formatting"""
-        # Use Phi-3's chat template format
         texts = []
         prompts = examples["prompt"] if isinstance(examples["prompt"], list) else [examples["prompt"]]
         responses = examples["response"] if isinstance(examples["response"], list) else [examples["response"]]
@@ -371,7 +405,9 @@ class WealthManagementTrainer:
             "eval_steps": 500,
             "save_steps": 500,
             "save_strategy": "steps",
-            "evaluation_strategy": "steps",
+            
+            # Changed to match new Transformers API
+            "eval_strategy": "steps",
             
             # Optimization
             "gradient_checkpointing": True,
@@ -393,7 +429,7 @@ class WealthManagementTrainer:
         # Add DDP-specific settings
         if self.gpu_info['use_ddp']:
             training_args_dict.update({
-                "ddp_find_unused_parameters": False,
+                "ddp_find_unused_parameters": True,  # Changed to True for LoRA compatibility
                 "ddp_backend": "nccl",
                 "local_rank": self.gpu_info['local_rank'],
             })
@@ -421,6 +457,9 @@ class WealthManagementTrainer:
         # Start training
         if not self.gpu_info['use_ddp'] or self.gpu_info['local_rank'] == 0:
             logger.info("Starting training...")
+        
+        # Ensure model is in training mode
+        self.model.train()
         
         train_result = trainer.train()
         
@@ -514,9 +553,9 @@ def main():
         model_name="microsoft/Phi-3-mini-4k-instruct",
         output_dir="phi3-wealth-lora",
         num_epochs=3,
-        base_batch_size=2,  # Will be adjusted based on GPU count
+        base_batch_size=1,  # Reduced to conserve memory
         learning_rate=2e-4,
-        max_length=2048
+        max_length=1024  # Reduced sequence length
     )
     
     # Initialize trainer (automatically detects and configures for available GPUs)
@@ -541,9 +580,9 @@ def main():
         
         # Final success message (only on main process)
         if not trainer.gpu_info['use_ddp'] or trainer.gpu_info['local_rank'] == 0:
-            logger.info("🎉 Fine-tuning completed successfully!")
-            logger.info(f"📁 Model saved in: {config.output_dir}")
-            logger.info("🔥 Your Phi-3 wealth management chatbot is ready!")
+            logger.info("Fine-tuning completed successfully!")
+            logger.info(f"Model saved in: {config.output_dir}")
+            logger.info("Your Phi-3 wealth management chatbot is ready!")
         
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
@@ -555,15 +594,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Usage Instructions:
-# 
-# Single GPU training:
-#   python wealth_management_finetune.py
-#
-# Multi-GPU training (distributed):
-#   torchrun --nproc_per_node=2 wealth_management_finetune.py
-#   (replace 2 with your number of GPUs)
-#
-# CPU training (if no GPU available):
-#   CUDA_VISIBLE_DEVICES="" python wealth_management_finetune.py
